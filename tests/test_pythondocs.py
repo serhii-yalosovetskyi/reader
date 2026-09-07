@@ -419,3 +419,15 @@ def test_unsplittable_document_passes_through_loudly(tmp_path, caplog):
     assert order == ["whatsnew/fat.xhtml"] and not anchors
     assert bodies["whatsnew/fat.xhtml"] == fat
     assert any("нарезки" in r.getMessage() for r in caplog.records)
+
+
+def test_chunk_name_stays_stable_when_key_is_not_ascii(caplog):
+    """Заголовок без ASCII не должен схлопывать имена кусков в одно.
+
+    Одинаковое имя означало бы позиционную нумерацию — ровно то, что нарезка
+    по устойчивому ключу и призвана исключить, причём молча."""
+    with caplog.at_level(logging.WARNING, logger="reader.pythondocs"):
+        a, b = pd._slug("Что нового"), pd._slug("Устаревшее")
+    assert a != b, "разные ключи дали одно имя куска"
+    assert a == pd._slug("Что нового"), "имя куска не воспроизводится"
+    assert any("хэш" in r.getMessage() for r in caplog.records), "подмена имени молчит"

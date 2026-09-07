@@ -16,6 +16,7 @@ spec.reader.python-docs.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import posixpath
 import re
@@ -460,7 +461,25 @@ def _group_key(segment: str, index: int) -> str:
 
 
 def _slug(key: str) -> str:
-    return _SLUG_BAD.sub("-", key).strip("-.").lower() or "part"
+    """Имя куска из ключа группы. Пустой результат — отдельный случай, не «part».
+
+    `_SLUG_BAD` схлопывает всё не-ASCII, поэтому у заголовка на кириллице от
+    ключа не остаётся ничего. Одинаковое имя для разных групп означало бы
+    позиционную нумерацию — ровно тот режим, который нарезка по устойчивому
+    ключу и должна исключать. Поэтому запасное имя выводится из ключа хэшем:
+    оно нечитаемо, но стабильно между пересборками, а вызывающий предупреждён.
+    """
+    slug = _SLUG_BAD.sub("-", key).strip("-.").lower()
+    if slug:
+        return slug
+    digest = hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    log.warning(
+        "pythondocs: из ключа группы %r не получилось читаемое имя куска, "
+        "беру хэш %s — имя стабильно, но по нему не видно, что внутри",
+        key,
+        digest,
+    )
+    return digest
 
 
 def _retitle(html: str, title: str) -> str:
