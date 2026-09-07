@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+import logging
+import posixpath
+import re
 import zipfile
 from pathlib import Path
 
@@ -262,3 +265,157 @@ def test_generated_xml_escapes_paths_from_foreign_archive(tmp_path):
         ET.fromstring(z.read("content.opf"))
         ET.fromstring(z.read("toc.ncx"))
         ET.fromstring(z.read("nav.xhtml"))
+
+
+# --------------------------------------------------------------------------
+# нарезка переросших документов
+# --------------------------------------------------------------------------
+def _release(series: str, micro: int, filler: int) -> str:
+    """Секция одного выпуска: заголовок задаёт серию, тело — вес."""
+    rid = f"python-{series.replace('.', '-')}-{micro}-final"
+    return (
+        f'<section id="{rid}"><h2>Python {series}.{micro} final</h2>'
+        f'<section id="{rid}-lib"><h3>Library</h3><p>{"x" * filler}</p></section>'
+        "</section>"
+    )
+
+
+def _master_with_fat_changelog(tmp_path: Path, releases: list[tuple[str, int]]) -> Path:
+    """Мастер с одним переросшим документом — как whatsnew/changelog.xhtml."""
+    body = "".join(_release(s, m, 200_000) for s, m in releases)
+    changelog = (
+        "<html><head><title>Changelog — Python 3.14.7 documentation</title></head>"
+        '<body><section id="changelog"><h1>Changelog</h1>'
+        f"{body}</section></body></html>"
+    )
+    first = f"python-{releases[0][0].replace('.', '-')}-{releases[0][1]}-final"
+    last = f"python-{releases[-1][0].replace('.', '-')}-{releases[-1][1]}-final"
+    opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="u">
+  <metadata/>
+  <manifest>
+    <item id="a" href="whatsnew/index.xhtml" media-type="application/xhtml+xml"/>
+    <item id="b" href="whatsnew/changelog.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="a"/><itemref idref="b"/></spine>
+</package>"""
+    ncx = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap>
+  <navPoint id="n1" playOrder="1"><navLabel><text>What's New</text></navLabel>
+    <content src="whatsnew/index.xhtml"/></navPoint>
+  <navPoint id="n2" playOrder="2"><navLabel><text>Changelog</text></navLabel>
+    <content src="whatsnew/changelog.xhtml"/>
+    <navPoint id="n3" playOrder="3"><navLabel><text>first</text></navLabel>
+      <content src="whatsnew/changelog.xhtml#{first}"/></navPoint>
+    <navPoint id="n4" playOrder="4"><navLabel><text>last</text></navLabel>
+      <content src="whatsnew/changelog.xhtml#{last}"/></navPoint>
+  </navPoint>
+</navMap></ncx>"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "master-big.epub"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr("content.opf", opf)
+        z.writestr("toc.ncx", ncx)
+        z.writestr(
+            "whatsnew/index.xhtml",
+            "<html><head><title>What's New</title></head><body>"
+            f'<a href="changelog.xhtml#{last}">последний выпуск</a></body></html>',
+        )
+        z.writestr("whatsnew/changelog.xhtml", changelog)
+    return path
+
+
+def _docs_of(epub: Path) -> dict[str, str]:
+    with zipfile.ZipFile(epub) as z:
+        return {
+            n: z.read(n).decode()
+            for n in z.namelist()
+            if n.endswith(".xhtml") and n != "cover.xhtml"
+        }
+
+
+def _anchors_of(docs: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name, html in docs.items():
+        for m in re.finditer(r'\bid="([^"]+)"', html):
+            out.setdefault(m.group(1), name)
+    return out
+
+
+RELEASES = [("3.14", 2), ("3.14", 1), ("3.14", 0), ("3.13", 1), ("3.13", 0), ("3.12", 0)]
+
+
+def test_oversized_document_is_split_into_chapters(tmp_path):
+    """Глава на мегабайты вешает вкладку читалки: пагинатор обходит Range по
+    сотням тысяч узлов. Ни один документ книги не должен быть толще потолка."""
+    master = _master_with_fat_changelog(tmp_path, RELEASES)
+    out = pd.build_part(master, "whatsnew", "3.14.7", tmp_path / "part.epub")
+    docs = _docs_of(out)
+    assert len(docs) > 2, "переросший документ не нарезан"
+    for name, html in docs.items():
+        assert len(html.encode()) <= pd.MAX_DOC_BYTES * 1.05, f"{name} толще потолка"
+    # первый кусок сохраняет исходное имя — на него ведут ссылки и закладки
+    assert "whatsnew/changelog.xhtml" in docs
+
+
+def test_split_keeps_every_anchor_reachable(tmp_path):
+    """Ссылка на выпуск обязана вести в тот кусок, где выпуск оказался.
+
+    Это ломается молча: ссылка `changelog.xhtml#python-3-12-0-final` ведёт в
+    первый кусок, якоря там нет, читалка просто ничего не делает."""
+    master = _master_with_fat_changelog(tmp_path, RELEASES)
+    out = pd.build_part(master, "whatsnew", "3.14.7", tmp_path / "part.epub")
+    docs = _docs_of(out)
+    anchors = _anchors_of(docs)
+    with zipfile.ZipFile(out) as z:
+        ncx = z.read("toc.ncx").decode()
+
+    broken = []
+    for name, html in docs.items():
+        base = posixpath.dirname(name)
+        for m in re.finditer(r'href="([^"#]*)#([^"]+)"', html):
+            path, anchor = m.group(1), m.group(2)
+            if "://" in path:
+                continue
+            target = posixpath.normpath(posixpath.join(base, path)) if path else name
+            if anchors.get(anchor) != target:
+                broken.append((name, m.group(0)))
+    assert not broken, f"ссылки ведут не в тот кусок: {broken[:3]}"
+
+    for m in re.finditer(r'src="([^"#]+)#([^"]+)"', ncx):
+        assert anchors.get(m.group(2)) == m.group(1), f"оглавление: {m.group(0)}"
+
+
+def test_split_boundaries_survive_a_new_release(tmp_path):
+    """Границы нарезки привязаны к минорной серии, а не к счётчику байтов.
+
+    Иначе новый выпуск сдвигает все границы, каждое ↻ перекраивает книгу, и
+    сохранённая позиция чтения перестаёт что-либо значить."""
+    before = pd.build_part(
+        _master_with_fat_changelog(tmp_path / "a", RELEASES),
+        "whatsnew", "3.14.7", tmp_path / "before.epub",
+    )
+    after = pd.build_part(
+        _master_with_fat_changelog(tmp_path / "b", [("3.14", 3), *RELEASES]),
+        "whatsnew", "3.14.8", tmp_path / "after.epub",
+    )
+    old, new = _docs_of(before), _docs_of(after)
+    frozen = [n for n in old if "3.12" in n or "3.13" in n]
+    assert frozen, "нечего проверять: старые серии не выделились в куски"
+    for name in frozen:
+        assert name in new, f"кусок {name} исчез после нового выпуска"
+        assert old[name] == new[name], f"кусок {name} перекроен новым выпуском"
+
+
+def test_unsplittable_document_passes_through_loudly(tmp_path, caplog):
+    """Резать не по чему — отдаём целиком, но в лог, а не молча: книга с такой
+    главой открывается десятки секунд, и это должно быть видно."""
+    fat = "<html><head><title>Fat</title></head><body><p>" + "y" * (
+        pd.MAX_DOC_BYTES + 1000
+    ) + "</p></body></html>"
+    with caplog.at_level(logging.WARNING, logger="reader.pythondocs"):
+        order, bodies, anchors = pd._split_doc("whatsnew/fat.xhtml", fat)
+    assert order == ["whatsnew/fat.xhtml"] and not anchors
+    assert bodies["whatsnew/fat.xhtml"] == fat
+    assert any("нарезки" in r.getMessage() for r in caplog.records)

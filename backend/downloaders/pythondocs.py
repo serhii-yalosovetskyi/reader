@@ -48,6 +48,14 @@ MAX_MASTER_BYTES = 100 * 1024 * 1024
 # копирует книгу к себе по sha1, а исходный временный файл не удаляет — за
 # двенадцать книг на каждую пересборку это десятки мегабайт в /tmp навсегда.
 PARTS_TTL_SEC = 6 * 3600
+# Потолок на ОДИН документ книги. Самая толстая глава, которая уже едет в этих
+# книгах и открывается за 3-5 с, — library/stdtypes.xhtml (0.69 МБ); берём чуть
+# выше неё. Число не с потолка: профилировщик фронта (задача #589) измерил
+# whatsnew/changelog.xhtml на 7.5 МБ — открытие 38-44 с вместо 3-5, заморозка
+# вкладки 15-18 с, 3.5 ГБ RSS, 74.6% времени в getBoundingClientRect ←
+# expand@paginator.js. Дорога не multicol-раскладка, а обход Range по 110 тыс.
+# узлов, поэтому лечится нарезкой документа, а не правкой пагинатора.
+MAX_DOC_BYTES = 768 * 1024
 
 # Часть документации = книга. `dirs` — каталоги внутри официального epub,
 # `roots` — отдельные файлы в его корне. Порядок словаря = порядок оглавления
@@ -402,21 +410,242 @@ def _complete_tree(tree: list[dict], docs: list[str], bodies: dict[str, str]) ->
     return out or tree
 
 
-def _rewrite_links(html: str, self_path: str, keep: set[str], known: set[str]) -> str:
+# --------------------------------------------------------------------------
+# нарезка переросших документов
+# --------------------------------------------------------------------------
+_SECTION_TOKEN = re.compile(r"<section\b[^>]*>|</section>", re.I)
+_ANY_ID = re.compile(r'\bid="([^"]+)"')
+_H_ANY = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.S | re.I)
+_H1_TEXT = re.compile(r"(<h1\b[^>]*>)(.*?)(</h1>)", re.S | re.I)
+_SERIES = re.compile(r"Python\s+(\d+)\.(\d+)\b")
+_SLUG_BAD = re.compile(r"[^A-Za-z0-9.]+")
+
+
+def _top_sections(html: str) -> list[tuple[int, int]]:
+    """Границы секций второго уровня вложенности (главы внутри документа).
+
+    Считаем по тегам, а не парсером: документ на 7.5 МБ через ElementTree стоит
+    сотен мегабайт памяти, а нам нужны только смещения.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start: int | None = None
+    for m in _SECTION_TOKEN.finditer(html):
+        if m.group(0).startswith("</"):
+            depth -= 1
+            if start is not None and depth == 1:
+                spans.append((start, m.end()))
+                start = None
+        else:
+            depth += 1
+            if depth == 2:
+                start = m.start()
+    return spans
+
+
+def _group_key(segment: str, index: int) -> str:
+    """Ключ группировки секции — устойчивый, а не порядковый.
+
+    Для журнала изменений это минорная серия («3.14.x»): новый выпуск 3.14.8
+    попадает в ту же группу, что и остальные 3.14.*, и границы нарезки не
+    съезжают на каждом обновлении. Иначе бы каждое ↻ перекраивало книгу и
+    сохранённая позиция чтения теряла смысл.
+    """
+    m = _H_ANY.search(segment)
+    title = re.sub(r"<[^>]+>", "", m.group(2)).strip() if m else ""
+    ser = _SERIES.search(title)
+    if ser:
+        return f"{ser.group(1)}.{ser.group(2)}.x"
+    return title or f"#{index}"
+
+
+def _slug(key: str) -> str:
+    return _SLUG_BAD.sub("-", key).strip("-.").lower() or "part"
+
+
+def _retitle(html: str, title: str) -> str:
+    """Заменить <title> и первый <h1> — так глава подписана в оглавлении."""
+    esc = _esc(title)
+    if _TITLE_RE.search(html):
+        html = _TITLE_RE.sub(lambda _m: f"<title>{esc}</title>", html, count=1)
+    return _H1_TEXT.sub(lambda m: f"{m.group(1)}{esc}{m.group(3)}", html, count=1)
+
+
+def _split_doc(href: str, html: str) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Разрезать переросший документ на главы по границам секций.
+
+    Возвращает (порядок файлов, тела, карта «якорь → файл»). Первый кусок
+    сохраняет исходное имя: на него ведут ссылки и оглавление, и позиция
+    чтения в начале книги переживает нарезку.
+
+    Имя куска — по ключу группы, а не по номеру: появление новой серии сверху
+    сдвинуло бы все номера и обесценило закладки.
+    """
+    if len(html.encode("utf-8")) <= MAX_DOC_BYTES:
+        return [href], {href: html}, {}
+
+    spans = _top_sections(html)
+    if len(spans) < 2:
+        # Резать не по чему: у документа нет внутренних секций. Отдаём целиком,
+        # но громко — книга с такой главой будет открываться десятки секунд.
+        log.warning(
+            "pythondocs: %s весит %.1f МБ и не имеет секций для нарезки — "
+            "глава уедет в книгу целиком, открытие будет медленным",
+            href,
+            len(html) / 1024 / 1024,
+        )
+        return [href], {href: html}, {}
+
+    prefix = html[: spans[0][0]]
+    suffix = html[spans[-1][1] :]
+    base_title = _doc_title(html, href)
+
+    groups: list[tuple[str, list[str]]] = []
+    for i, (a, b) in enumerate(spans):
+        seg = html[a:b]
+        key = _group_key(seg, i)
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(seg)
+        else:
+            groups.append((key, [seg]))
+
+    # Мелкие группы склеиваем: у документа без осмысленных ключей (каждая
+    # секция — своя группа) иначе вышли бы десятки крошечных файлов. Порог
+    # намеренно низкий: группа размером с настоящую главу должна стоять
+    # отдельным файлом, иначе рост соседа сдвинет её границу и обесценит
+    # сохранённую позицию чтения.
+    glue = MAX_DOC_BYTES // 8
+    merged: list[tuple[str, list[str]]] = []
+    for key, segs in groups:
+        size = sum(len(x) for x in segs)
+        if (
+            merged
+            and size <= glue
+            and sum(len(x) for x in merged[-1][1]) + size <= MAX_DOC_BYTES
+        ):
+            merged[-1][1].extend(segs)
+        else:
+            merged.append((key, list(segs)))
+
+    # Группа, которая сама не влезает, режется по своим секциям.
+    chunks: list[tuple[str, str, list[str]]] = []  # (ключ, подпись, секции)
+    for key, segs in merged:
+        if sum(len(x) for x in segs) <= MAX_DOC_BYTES:
+            chunks.append((key, key, segs))
+            continue
+        cur: list[str] = []
+        part_no = 1
+        for seg in segs:
+            if cur and sum(len(x) for x in cur) + len(seg) > MAX_DOC_BYTES:
+                chunks.append((key if part_no == 1 else f"{key}-{part_no}",
+                               key if part_no == 1 else f"{key} ({part_no})", cur))
+                part_no += 1
+                cur = []
+            cur.append(seg)
+        if cur:
+            chunks.append((key if part_no == 1 else f"{key}-{part_no}",
+                           key if part_no == 1 else f"{key} ({part_no})", cur))
+
+    stem, ext = (href[: -len(".xhtml")], ".xhtml") if href.endswith(".xhtml") else (href, "")
+    order: list[str] = []
+    bodies: dict[str, str] = {}
+    anchors: dict[str, str] = {}
+    used: set[str] = set()
+    for i, (key, label, segs) in enumerate(chunks):
+        if i == 0:
+            name = href
+        else:
+            slug = _slug(key)
+            name = f"{stem}-{slug}{ext}"
+            n = 2
+            while name in used:
+                name = f"{stem}-{slug}-{n}{ext}"
+                n += 1
+        used.add(name)
+        body = prefix + "".join(segs) + suffix
+        title = base_title if len(chunks) == 1 else f"{base_title} — {label}"
+        body = _retitle(body, title)
+        order.append(name)
+        bodies[name] = body
+        for m in _ANY_ID.finditer(body):
+            anchors.setdefault(m.group(1), name)
+
+    log.info(
+        "pythondocs: %s (%.1f МБ) нарезан на %d глав, самая толстая %.2f МБ",
+        href,
+        len(html) / 1024 / 1024,
+        len(order),
+        max(len(b) for b in bodies.values()) / 1024 / 1024,
+    )
+    return order, bodies, anchors
+
+
+def _retarget(src: str, moved: dict[str, dict[str, str]]) -> str:
+    """Точка оглавления `doc.xhtml#anchor` → тот кусок, где якорь оказался."""
+    path, sep, anchor = src.partition("#")
+    table = moved.get(path)
+    if not table or not sep:
+        return src
+    return f"{table.get(anchor, path)}#{anchor}"
+
+
+def _retarget_tree(tree: list[dict], moved: dict[str, dict[str, str]]) -> list[dict]:
+    return [
+        {
+            "title": n["title"],
+            "src": _retarget(n["src"], moved),
+            "children": _retarget_tree(n["children"], moved),
+        }
+        for n in tree
+    ]
+
+
+def _rewrite_links(
+    html: str,
+    self_path: str,
+    keep: set[str],
+    known: set[str],
+    moved: dict[str, dict[str, str]] | None = None,
+    origin: str | None = None,
+) -> str:
     """Ссылки ЗА пределы части — на сайт, внутри части — как есть.
 
     После разреза половина перекрёстных ссылок документации ведёт в файлы,
     которых в этой книге нет. Оставить их — значит отдать читателю мёртвую
     ссылку; переписываем в абсолютный `https://docs.python.org/3/…`.
+
+    `moved` — карта нарезанных документов («якорь → файл, где он оказался»),
+    `origin` — исходное имя документа, из которого получен этот кусок. Без них
+    ссылка `changelog.xhtml#python-3-9-0-final` вела бы в первый кусок, где
+    такого якоря уже нет, и молча не срабатывала.
     """
     base_dir = posixpath.dirname(self_path)
+    moved = moved or {}
+    origin = origin or self_path
+
+    def relative(target: str) -> str:
+        rel = posixpath.relpath(target, base_dir) if base_dir else target
+        return rel
 
     def sub(m: re.Match) -> str:
         attr, value = m.group(1), m.group(2)
-        if not value or value[0] in "#?" or "://" in value or value.startswith("mailto:"):
+        if not value or value[0] == "?" or "://" in value or value.startswith("mailto:"):
             return m.group(0)
+        if value[0] == "#":
+            # Внутренняя ссылка куска: якорь мог уехать в соседний кусок.
+            table = moved.get(origin)
+            if not table:
+                return m.group(0)
+            chunk = table.get(value[1:])
+            if not chunk or chunk == self_path:
+                return m.group(0)
+            return f'{attr}="{relative(chunk)}{value}"'
         path, _, anchor = value.partition("#")
         target = posixpath.normpath(posixpath.join(base_dir, path)) if path else self_path
+        table = moved.get(target)
+        if table is not None and anchor:
+            chunk = table.get(anchor, target)
+            return f'{attr}="{relative(chunk)}#{anchor}"'
         if target in keep:
             return m.group(0)
         if target in known:
@@ -572,20 +801,38 @@ def build_part(master: Path, key: str, ver: str, out_path: Path | None = None) -
         docs = [h for h in spine if _in_part(h, part)]
         if not docs:
             raise DownloaderError(f"в архиве нет раздела «{key}»")
-        keep = set(docs)
         tree = _nav_tree(z.read("toc.ncx").decode("utf-8"), part)
 
-        bodies: dict[str, str] = {}
+        # Сначала нарезка, только потом переписывание ссылок: иначе ссылки
+        # проставляются на документы, которых после нарезки не существует,
+        # и ломаются молча — ни ошибки, ни следа в логе.
+        raw: dict[str, str] = {}
         images: set[str] = set()
+        chunked: list[str] = []
+        moved: dict[str, dict[str, str]] = {}
+        origin_of: dict[str, str] = {}
         for href in docs:
             html = z.read(href).decode("utf-8")
             for m in _IMG_REF.finditer(html):
                 cand = f"_images/{m.group(1)}"
                 if cand in names:
                     images.add(cand)
-            bodies[href] = _rewrite_links(html, href, keep, names)
+            order, parts_html, anchors = _split_doc(href, html)
+            if anchors:
+                moved[href] = anchors
+            for name in order:
+                chunked.append(name)
+                raw[name] = parts_html[name]
+                origin_of[name] = href
 
-        tree = _complete_tree(tree, docs, bodies)
+        docs = chunked
+        keep = set(docs)
+        bodies = {
+            name: _rewrite_links(html, name, keep, names, moved, origin_of[name])
+            for name, html in raw.items()
+        }
+
+        tree = _complete_tree(_retarget_tree(tree, moved), docs, bodies)
         # Логотип берём из самого архива документации — официальный, и он уже
         # скачан; отдельного запроса за картинкой не нужно.
         logo = z.read(LOGO_ASSET) if LOGO_ASSET in names else None
